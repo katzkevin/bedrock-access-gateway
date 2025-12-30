@@ -49,6 +49,7 @@ from api.setting import (
     ENABLE_CROSS_REGION_INFERENCE,
     ENABLE_APPLICATION_INFERENCE_PROFILES,
     ENABLE_PROMPT_CACHING,
+    MAX_OUTPUT_TOKENS,
 )
 
 logger = logging.getLogger(__name__)
@@ -733,8 +734,10 @@ class BedrockModel(BaseChatModel):
         system_prompts = self._parse_system_prompts(chat_request)
 
         # Base inference parameters.
+        # Cap max_tokens at MAX_OUTPUT_TOKENS (Bedrock limit for Claude Opus 4 is 32000)
+        max_tokens = min(chat_request.max_tokens, MAX_OUTPUT_TOKENS) if chat_request.max_tokens else MAX_OUTPUT_TOKENS
         inference_config = {
-            "maxTokens": chat_request.max_tokens,
+            "maxTokens": max_tokens,
         }
 
         # Only include optional parameters when specified
@@ -777,15 +780,17 @@ class BedrockModel(BaseChatModel):
 
             if "anthropic.claude" in model_lower:
                 # Claude format: reasoning_config = object with budget_tokens
-                max_tokens = (
+                # Cap at MAX_OUTPUT_TOKENS (Bedrock limit for Claude Opus 4 is 32000)
+                reasoning_max_tokens = (
                     chat_request.max_completion_tokens
                     if chat_request.max_completion_tokens
                     else chat_request.max_tokens
                 )
+                reasoning_max_tokens = min(reasoning_max_tokens, MAX_OUTPUT_TOKENS) if reasoning_max_tokens else MAX_OUTPUT_TOKENS
                 budget_tokens = self._calc_budget_tokens(
-                    max_tokens, chat_request.reasoning_effort
+                    reasoning_max_tokens, chat_request.reasoning_effort
                 )
-                inference_config["maxTokens"] = max_tokens
+                inference_config["maxTokens"] = reasoning_max_tokens
                 # unset topP - Not supported
                 inference_config.pop("topP", None)
 
