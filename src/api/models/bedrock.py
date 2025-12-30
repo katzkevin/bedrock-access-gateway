@@ -24,6 +24,7 @@ from api.schema import (
     Choice,
     ChoiceDelta,
     CompletionTokensDetails,
+    DeveloperMessage,
     Embedding,
     EmbeddingsRequest,
     EmbeddingsResponse,
@@ -94,6 +95,7 @@ profile_metadata = {}
 TEMPERATURE_TOPP_CONFLICT_MODELS = {
     "claude-sonnet-4-5",
     "claude-haiku-4-5",
+    "claude-opus-4-5",
 }
 
 
@@ -162,7 +164,7 @@ def list_bedrock_models() -> dict:
                     except Exception as e:
                         logger.warning(f"Error processing application profile: {e}")
                         continue
-                    
+
         # List foundation models, only cares about text outputs here.
         response = bedrock_client.list_foundation_models(byOutputModality="TEXT")
 
@@ -375,7 +377,7 @@ class BedrockModel(BaseChatModel):
 
         # Extract prompt caching metrics if available
         cache_read_tokens = usage.get("cacheReadInputTokens", 0)
-        cache_creation_tokens = usage.get("cacheCreationInputTokens", 0)
+        cache_creation_tokens = usage.get("cacheWriteInputTokens", 0)
 
         # Calculate actual prompt tokens
         # Bedrock's totalTokens includes all: inputTokens + cacheRead + cacheWrite + outputTokens
@@ -454,7 +456,7 @@ class BedrockModel(BaseChatModel):
         """
         system_prompts = []
         for message in chat_request.messages:
-            if message.role != "system":
+            if message.role not in ("system", "developer"):
                 continue
             if not isinstance(message.content, str):
                 raise TypeError(f"System message content must be a string, got {type(message.content).__name__}")
@@ -533,7 +535,7 @@ class BedrockModel(BaseChatModel):
                     has_content = len(message.content) > 0
                 elif message.content is not None:
                     has_content = True
-                
+
                 if has_content:
                     # Text message
                     messages.append(
@@ -566,10 +568,10 @@ class BedrockModel(BaseChatModel):
                 # Bedrock does not support tool role,
                 # Add toolResult to content
                 # https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ToolResultBlock.html
-                
+
                 # Handle different content formats from OpenAI SDK
                 tool_content = self._extract_tool_content(message.content)
-                
+
                 messages.append(
                     {
                         "role": "user",
@@ -591,7 +593,7 @@ class BedrockModel(BaseChatModel):
 
     def _extract_tool_content(self, content) -> str:
         """Extract text content from various OpenAI SDK tool message formats.
-        
+
         Handles:
         - String content (legacy format)
         - List of content objects (OpenAI SDK 1.91.0+)
@@ -600,7 +602,7 @@ class BedrockModel(BaseChatModel):
         try:
             if isinstance(content, str):
                 return content
-            
+
             if isinstance(content, list):
                 text_parts = []
                 for i, item in enumerate(content):
@@ -632,7 +634,7 @@ class BedrockModel(BaseChatModel):
                         # Convert any other type to string
                         text_parts.append(str(item))
                 return "\n".join(text_parts)
-            
+
             # Fallback for any other type
             return str(content)
         except Exception as e:
@@ -964,11 +966,13 @@ class BedrockModel(BaseChatModel):
         finish_reason = None
         message = None
         usage = None
+
         if "messageStart" in chunk:
             message = ChatResponseMessage(
                 role=chunk["messageStart"]["role"],
                 content="",
             )
+
         if "contentBlockStart" in chunk:
             # tool call start
             delta = chunk["contentBlockStart"]["start"]
@@ -988,25 +992,30 @@ class BedrockModel(BaseChatModel):
                         )
                     ]
                 )
+
         if "contentBlockDelta" in chunk:
             delta = chunk["contentBlockDelta"]["delta"]
             if "text" in delta:
-                # stream content
-                message = ChatResponseMessage(
-                    content=delta["text"],
-                )
+                # Regular text content - close thinking tag if open
+                content = delta["text"]
+                if self.think_emitted:
+                    # Transition from reasoning to regular text
+                    content = "</think>" + content
+                    self.think_emitted = False
+                message = ChatResponseMessage(content=content)
             elif "reasoningContent" in delta:
                 if "text" in delta["reasoningContent"]:
                     content = delta["reasoningContent"]["text"]
                     if not self.think_emitted:
-                        # Port of "content_block_start" with "thinking"
+                        # Start of reasoning content
                         content = "<think>" + content
                         self.think_emitted = True
                     message = ChatResponseMessage(content=content)
                 elif "signature" in delta["reasoningContent"]:
-                    # Port of "signature_delta"
+                    # Port of "signature_delta" (for models that send it)
                     if self.think_emitted:
-                        message = ChatResponseMessage(content="\n </think> \n\n")
+                        message = ChatResponseMessage(content="</think>")
+                        self.think_emitted = False
                     else:
                         return None  # Ignore signature if no <think> started
             else:
@@ -1022,7 +1031,23 @@ class BedrockModel(BaseChatModel):
                         )
                     ]
                 )
+
         if "messageStop" in chunk:
+            # Safety check: Close any open thinking tags before message stops
+            if self.think_emitted:
+                self.think_emitted = False
+                return ChatStreamResponse(
+                    id=message_id,
+                    model=model_id,
+                    choices=[
+                        ChoiceDelta(
+                            index=0,
+                            delta=ChatResponseMessage(content="</think>"),
+                            logprobs=None,
+                            finish_reason=None,
+                        )
+                    ],
+                )
             message = ChatResponseMessage()
             finish_reason = chunk["messageStop"]["stopReason"]
 
@@ -1035,7 +1060,7 @@ class BedrockModel(BaseChatModel):
 
                 # Extract prompt caching metrics if available
                 cache_read_tokens = usage_data.get("cacheReadInputTokens", 0)
-                cache_creation_tokens = usage_data.get("cacheCreationInputTokens", 0)
+                cache_creation_tokens = usage_data.get("cacheWriteInputTokens", 0)
 
                 # Create prompt_tokens_details if cache metrics are available
                 prompt_tokens_details = None
@@ -1063,6 +1088,7 @@ class BedrockModel(BaseChatModel):
                         prompt_tokens_details=prompt_tokens_details,
                     ),
                 )
+
         if message:
             return ChatStreamResponse(
                 id=message_id,
